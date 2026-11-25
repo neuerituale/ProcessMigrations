@@ -43,7 +43,7 @@ class ProcessMigrations extends Process implements Module, ConfigurableModule {
 	public static function getModuleInfo(): array {
 		return [
 			'title' => 'Migrations',
-			'version' => 100,
+			'version' => 101,
 			'summary' => 'Run schema and data migrations step by step, from the admin, a cron job or the CLI.',
 			'author' => 'Neue Rituale',
 			'href' => 'https://github.com/neuerituale/ProcessMigrations',
