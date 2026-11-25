@@ -1,0 +1,26 @@
+{
+    "name": "nr/processmigrations",
+    "type": "pw-module",
+    "description": "Run schema and data migrations step by step, from the admin, a cron job or the CLI",
+    "keywords": [ "processwire", "module", "migrations", "deployment" ],
+    "homepage": "https://github.com/neuerituale/ProcessMigrations",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Neue Rituale",
+            "email": "code@neuerituale.com",
+            "homepage": "https://neuerituale.com/",
+            "role": "Developer"
+        }
+    ],
+    "minimum-stability": "beta",
+    "require": {
+        "php": ">=8.1",
+        "hari/pw-module": "~1.0"
+    },
+    "config": {
+        "allow-plugins": {
+            "hari/pw-module": true
+        }
+    }
+}
