@@ -42,7 +42,7 @@ $config->migrationsPath = 'site/migrations/';
 Keep the directory in your version control, it's part of your code.
 
 ## Write a migration
-A migration is a file `Migration_<version>.php` in the migrations directory with the class `Migration_<version>` in the `ProcessWire` namespace, extending `MigrationStep`. The version is a positive integer: count up (`1`, `2`, `3` …) or, in a team with parallel branches, use a timestamp (`202611251430`) to avoid conflicts. Migrations run in ascending order of their version.
+A migration is a file `Migration_<version>.php` in the migrations directory with the class `Migration_<version>` in the `ProcessWire` namespace, extending `MigrationStep`. The version is a positive integer: count up (`1`, `2`, `3` …) or, in a team with parallel branches, use a timestamp (`202611251430`) to avoid conflicts. Migrations run in ascending order of their version. Two files with the same version (`Migration_2.php`, `Migration_02.php`) are an error: the second one is ignored with a warning. A file with a syntax error stops every run until it is fixed, so no later migration runs before it.
 
 ```php
 <?php namespace ProcessWire;
@@ -87,10 +87,10 @@ Files a migration needs (images, JSON, SQL …) are best placed next to it, e.g.
 
 | Method | What it does |
 | --- | --- |
-| `ensureField($name, $type, $label, $settings = [])` | Creates a field or updates its label and settings. `$settings['options']` (`[value => title]`) sets the options of a `FieldtypeOptions` field. A field of another type is left alone with a warning. |
+| `ensureField($name, $type, $label, $settings = [])` | Creates a field or updates its label and settings. `$settings['options']` (`[value => title]`) sets the options of a `FieldtypeOptions` field. A field of another type is left alone with a warning. An unknown fieldtype, an invalid name or `options` for another fieldtype throw before anything is saved. |
 | `setOptions($field, $options)` | Options of a `FieldtypeOptions` field. The option ids are the positions: only append new values. |
-| `convertField($name, $type, $label, $settings = [])` | Changes the type of a field ProcessWire can't convert itself (e.g. text to options): keeps the values and the position in all fieldgroups. |
-| `ensureTemplate($name, $fieldNames, $settings = [])` | Creates a template with its own fieldgroup or adds missing fields. `parentTemplates` / `childTemplates` are given as template names. Templates are created without a file (`noFile`), pass `'noFile' => 0` for templates that render. |
+| `convertField($name, $type, $label, $settings = [])` | Changes the type of a field ProcessWire can't convert itself (e.g. text to options): keeps the values, the position and the context settings in all fieldgroups. Values the new type doesn't accept (e.g. a text without a matching option) are listed in a warning. An unknown fieldtype throws before the old field is deleted. |
+| `ensureTemplate($name, $fieldNames, $settings = [])` | Creates a template with its own fieldgroup or adds missing fields (never removes any). `parentTemplates` / `childTemplates` are given as template names, unknown names give a warning. Unknown fields throw before anything is saved. New templates are created without a file (`noFile`), pass `'noFile' => 0` for templates that render; existing templates keep their `noFile`. |
 | `ensureModule($name)` | Installs a module, also one that came with the same deployment. |
 | `ensureColumn($table, $column, $definition)` | Adds a column to a custom table, e.g. `ensureColumn('orders', 'note', 'TEXT NULL AFTER total')`. |
 
@@ -179,3 +179,13 @@ $migrations->getAutoRun();          // auto mode: '', 'superuser' or 'always'
 
 ## Uninstall
 Uninstalling drops the table `process_migrations` with the executed versions. The migration files stay. After a new install all migrations are pending again – they are idempotent, so running them again is safe.
+
+## Tests
+Integration tests against the ProcessWire installation the module lives in (each case in its own PHP process):
+
+```bash
+php site/modules/ProcessMigrations/tests/run.php            # all cases
+php site/modules/ProcessMigrations/tests/run.php field cli  # cases whose file name contains "field" or "cli"
+```
+
+**Development installations only:** the cases change fields, templates, modules and pages. The runner copies all tables into `<dbName>_pmtest_snapshot` first and restores them after every case; an aborted run is restored on the next start. The HTTP cases (auto mode, admin) need the site reachable at `https://<first httpHost>` or `PM_TEST_URL`, otherwise they are skipped. `NOTE` lines are observations, not failures.

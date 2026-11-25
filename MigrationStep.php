@@ -28,18 +28,24 @@ abstract class MigrationStep extends Wire {
 	 */
 	protected function ensureField(string $name, string $type, string $label, array $settings = []): Field {
 		$fields = $this->wire()->fields;
+		if($name === '' || $this->wire()->sanitizer->fieldName($name) !== $name) throw new WireException("Invalid field name \"$name\"");
 		$field = $fields->get($name);
 		if($field && $field->type->className() !== $type) {
 			$this->warning("Field $name is " . $field->type->className() . ", not $type: left unchanged");
 			return $field;
 		}
-		if(!$field) {
-			$field = new Field();
-			$field->type = $this->wire()->modules->get($type);
-			$field->name = $name;
-		}
 		$options = $settings['options'] ?? null;
 		unset($settings['options']);
+		// check everything before anything is saved
+		$fieldtype = $field ? $field->type : $this->fieldtype($type);
+		if($options !== null && !$fieldtype instanceof FieldtypeOptions) {
+			throw new WireException("Options are only for FieldtypeOptions, field $name is $type");
+		}
+		if(!$field) {
+			$field = new Field();
+			$field->type = $fieldtype;
+			$field->name = $name;
+		}
 		$field->label = $label;
 		if($options !== null) $field->set('inputfieldClass', 'InputfieldSelect');
 		foreach($settings as $key => $value) $field->set($key, $value);
@@ -47,6 +53,15 @@ abstract class MigrationStep extends Wire {
 
 		if($options !== null) $this->setOptions($field, $options);
 		return $field;
+	}
+
+	/**
+	 * The Fieldtype module $type (installed if needed), throws if there is none
+	 */
+	private function fieldtype(string $type): Fieldtype {
+		$fieldtype = $this->wire()->modules->get($type);
+		if(!$fieldtype instanceof Fieldtype) throw new WireException("Fieldtype $type not found");
+		return $fieldtype;
 	}
 
 	/**
@@ -72,16 +87,20 @@ abstract class MigrationStep extends Wire {
 			$this->ensureField($name, $type, $label, $settings);
 			return;
 		}
+		// before the old field is deleted: the new type must exist
+		$this->fieldtype($type);
 
 		$values = $database->query('SELECT pages_id, data FROM `' . $database->escapeTable($field->getTable()) . '`')->fetchAll(\PDO::FETCH_KEY_PAIR);
 
-		// position in every fieldgroup: the field before it
+		// position in every fieldgroup (the field before it, null: first) and the context settings
 		$positions = [];
+		$contexts = [];
 		foreach($this->wire()->fieldgroups as $fieldgroup) {
 			if(!$fieldgroup->hasField($field)) continue;
 			$names = array_values($fieldgroup->explode('name'));
 			$index = array_search($name, $names);
 			$positions[$fieldgroup->name] = $index > 0 ? $names[$index - 1] : null;
+			$contexts[$fieldgroup->name] = $fieldgroup->getFieldContextArray($field->id);
 			$fieldgroup->remove($field);
 			$fieldgroup->save();
 		}
@@ -93,30 +112,44 @@ abstract class MigrationStep extends Wire {
 			$fieldgroup = $this->wire()->fieldgroups->get($fieldgroupName);
 			if($after && $fieldgroup->hasField($after)) {
 				$fieldgroup->insertAfter($field, $fieldgroup->getField($after));
+			} else if(!$after && $fieldgroup->count()) {
+				$fieldgroup->insertBefore($field, $fieldgroup->first());
 			} else {
 				$fieldgroup->add($field);
 			}
+			if(count($contexts[$fieldgroupName])) $fieldgroup->setFieldContextArray($field->id, $contexts[$fieldgroupName]);
 			$fieldgroup->save();
 		}
 
 		$pages = $this->wire()->pages;
+		$lost = [];
 		foreach($values as $pageId => $value) {
 			$page = $pages->get((int) $pageId);
 			if(!$page->id || (string) $value === '') continue;
 			$page->of(false);
 			$page->set($name, (string) $value);
 			$page->save($name, ['quiet' => true]);
+			$converted = $page->getUnformatted($name);
+			if($converted instanceof WireArray ? !$converted->count() : (string) $converted === '') $lost[] = "$pageId: $value";
 		}
 		$this->message("Field $name converted to $type (" . count($values) . ' values)');
+		if(count($lost)) $this->warning("Field $name: " . count($lost) . " values could not be converted (page id: value): " . implode(', ', $lost));
 	}
 
 	/**
 	 * Create a template (with its own fieldgroup) or add missing fields and apply settings
 	 *
-	 * @param array $settings template settings, 'parentTemplates' / 'childTemplates' as template names, 'noFile' => 0 for templates with a file
+	 * @param array $settings template settings, 'parentTemplates' / 'childTemplates' as template names. New templates get 'noFile' => 1 unless given (pass 'noFile' => 0 for templates with a file).
 	 */
 	protected function ensureTemplate(string $name, array $fieldNames, array $settings = []): Template {
 		$templates = $this->wire()->templates;
+		$fields = $this->wire()->fields;
+		if($name === '' || $this->wire()->sanitizer->templateName($name) !== $name) throw new WireException("Invalid template name \"$name\"");
+		// check the fields before anything is saved
+		foreach($fieldNames as $fieldName) {
+			if(!$fields->get($fieldName)) throw new WireException("Template $name: field $fieldName does not exist");
+		}
+
 		$template = $templates->get($name);
 		if(!$template) {
 			$fieldgroup = new Fieldgroup();
@@ -125,6 +158,8 @@ abstract class MigrationStep extends Wire {
 			$template = new Template();
 			$template->name = $name;
 			$template->fieldgroup = $fieldgroup;
+			// new templates without a file by default (data only); pages that render pass 'noFile' => 0
+			$template->set('noFile', 1);
 			$templates->save($template);
 		}
 
@@ -139,13 +174,15 @@ abstract class MigrationStep extends Wire {
 			$ids = [];
 			foreach($settings[$key] as $templateName) {
 				$related = $templates->get($templateName);
-				if($related) $ids[] = $related->id;
+				if($related) {
+					$ids[] = $related->id;
+				} else {
+					$this->warning("Template $name: $key has the unknown template $templateName");
+				}
 			}
 			$template->set($key, $ids);
 			unset($settings[$key]);
 		}
-		// templates without a file by default (data only); pages that render pass 'noFile' => 0
-		$template->set('noFile', 1);
 		foreach($settings as $key => $value) $template->set($key, $value);
 		$templates->save($template);
 		return $template;
@@ -183,8 +220,9 @@ abstract class MigrationStep extends Wire {
 		$database = $this->wire()->database;
 		$table = $database->escapeTable($table);
 		$column = $database->escapeCol($column);
+		// escaped: _ and % are wildcards in LIKE
 		$query = $database->prepare("SHOW COLUMNS FROM `$table` LIKE :column");
-		$query->execute([':column' => $column]);
+		$query->execute([':column' => addcslashes($column, '\\%_')]);
 		if($query->rowCount()) return;
 		$database->exec("ALTER TABLE `$table` ADD `$column` $definition");
 		$this->message("Column $table.$column added");

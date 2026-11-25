@@ -31,6 +31,15 @@ class ProcessMigrations extends Process implements Module, ConfigurableModule {
 	const autoRunSuperuser = 'superuser';
 	const autoRunAlways = 'always';
 
+	/** @var bool whether the table was checked in this request */
+	private bool $tableChecked = false;
+
+	/** @var \Throwable[] migration files that could not be loaded in this request: [file => error] */
+	private array $loadErrors = [];
+
+	/** @var int|null version of the migration that runs right now */
+	private ?int $running = null;
+
 	public static function getModuleInfo(): array {
 		return [
 			'title' => 'Migrations',
@@ -127,12 +136,25 @@ class ProcessMigrations extends Process implements Module, ConfigurableModule {
 		} catch(\Throwable $e) {
 			$this->saveState('autoFailed', [
 				'signature' => $signature,
-				'version' => (string) array_key_first($this->pending()),
+				'version' => $this->failedVersion($e),
 				'error' => $e->getMessage(),
 				'time' => time(),
 			]);
 		} finally {
 			if($switchUser) $users->setCurrentUser($user);
+		}
+	}
+
+	/**
+	 * Version of the migration that caused $e: the one running, the file that failed to load or the first pending one
+	 */
+	private function failedVersion(\Throwable $e): string {
+		if($this->running !== null) return (string) $this->running;
+		if(preg_match('/Migration_(\d+)\.php$/', $e->getFile(), $matches)) return (string) (int) $matches[1];
+		try {
+			return (string) array_key_first($this->pending());
+		} catch(\Throwable) {
+			return '?';
 		}
 	}
 
@@ -162,7 +184,7 @@ class ProcessMigrations extends Process implements Module, ConfigurableModule {
 
 	public function ___install(): void {
 		parent::___install();
-		$this->ensureTable();
+		$this->ensureTable(true);
 		$path = $this->getMigrationsPath();
 		if(!is_dir($path) && !wireMkdir($path, true)) $this->warning(sprintf($this->_('Could not create the directory %s'), $path));
 	}
@@ -171,6 +193,7 @@ class ProcessMigrations extends Process implements Module, ConfigurableModule {
 		parent::___uninstall();
 		// the migration files stay, only the record of executed versions is removed
 		$this->wire()->database->exec('DROP TABLE IF EXISTS `' . self::table . '`');
+		$this->tableChecked = false;
 	}
 
 	/* ***** Admin *** */
@@ -298,14 +321,17 @@ class ProcessMigrations extends Process implements Module, ConfigurableModule {
 	 */
 	protected function ___run(int $version, string $class): bool {
 		$log = $this->wire()->log;
-		$log->save(self::logName, "Migration $version: " . $class::description());
+		$this->running = $version;
 		try {
+			$log->save(self::logName, "Migration $version: " . $class::description());
 			/** @var MigrationStep $migration */
 			$migration = $this->wire(new $class());
 			$migration->up();
 		} catch(\Throwable $e) {
 			$log->save(self::logName, "Migration $version failed: " . $e->getMessage());
 			throw $e;
+		} finally {
+			$this->running = null;
 		}
 		$query = $this->wire()->database->prepare('INSERT INTO `' . self::table . '` (version, executed) VALUES(:version, NOW()) ON DUPLICATE KEY UPDATE executed=NOW()');
 		$query->execute([':version' => $version]);
@@ -345,7 +371,9 @@ class ProcessMigrations extends Process implements Module, ConfigurableModule {
 	 */
 	public function ___getMigrationsPath(): string {
 		$config = $this->wire()->config;
-		$path = trim((string) ($config->get('migrationsPath') ?: $this->migrationsPath ?: self::defaultPath));
+		$path = trim((string) $config->get('migrationsPath'));
+		if($path === '') $path = trim((string) $this->migrationsPath);
+		if($path === '') $path = self::defaultPath;
 		if(!str_starts_with($path, '/')) $path = $config->paths->root . ltrim($path, '/');
 		return rtrim($path, '/') . '/';
 	}
@@ -356,12 +384,26 @@ class ProcessMigrations extends Process implements Module, ConfigurableModule {
 	public function migrations(): array {
 		require_once __DIR__ . '/MigrationStep.php';
 		$migrations = [];
+		$files = [];
 		foreach(glob($this->getMigrationsPath() . 'Migration_*.php') ?: [] as $file) {
-			if(!preg_match('/Migration_(\d+)\.php$/', $file, $matches)) continue;
-			require_once $file;
+			if(!is_file($file) || !preg_match('/Migration_(\d+)\.php$/', $file, $matches)) continue;
+			$version = (int) $matches[1];
 			$class = __NAMESPACE__ . '\\Migration_' . $matches[1];
-			if(class_exists($class, false) && is_subclass_of($class, MigrationStep::class)) {
-				$migrations[(int) $matches[1]] = $class;
+			if(isset($files[$version])) {
+				$this->warning(sprintf($this->_('%1$s has the same version as %2$s and is ignored'), basename($file), basename($files[$version])));
+				continue;
+			}
+			$files[$version] = $file;
+			// a file that failed (syntax error) is marked as included by PHP: fail again instead of skipping it
+			if(isset($this->loadErrors[$file])) throw $this->loadErrors[$file];
+			try {
+				require_once $file;
+			} catch(\Throwable $e) {
+				$this->loadErrors[$file] = $e;
+				throw $e;
+			}
+			if(class_exists($class, false) && is_subclass_of($class, MigrationStep::class) && !(new \ReflectionClass($class))->isAbstract()) {
+				$migrations[$version] = $class;
 			} else {
 				$this->warning(sprintf($this->_('%1$s does not define the class %2$s extending MigrationStep'), basename($file), $class));
 			}
@@ -386,10 +428,9 @@ class ProcessMigrations extends Process implements Module, ConfigurableModule {
 		return array_diff_key($this->migrations(), $this->executed());
 	}
 
-	private function ensureTable(): void {
-		static $checked = false;
-		if($checked) return;
-		$checked = true;
+	private function ensureTable(bool $force = false): void {
+		if($this->tableChecked && !$force) return;
+		$this->tableChecked = true;
 		$config = $this->wire()->config;
 		// BIGINT: versions may be timestamps like 202611251430
 		$this->wire()->database->exec(
